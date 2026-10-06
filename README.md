@@ -20,6 +20,7 @@ Claude Code skills ของฉัน เก็บรวมไว้ที่น
 | [`implement`](implement/) | ทำงานจาก spec/ticket set — ticket loop, 3 gates (build/review/e2e), one ticket per session |
 | [`tdd`](tdd/) | Test-driven development, red-green-refactor |
 | [`fix-bug`](fix-bug/) | loop แก้บั๊ก: confirm goal → repro (red) → root cause → plan → delegate → review loop → close |
+| [`fix-bug-parallel`](fix-bug-parallel/) | `fix-bug` หลายบั๊กพร้อมกัน บั๊กละ session/worktree — เทสต์หนักเข้าคิวผ่านสคริปต์ `heavy-test` (Python stdlib) ที่สลับ service ของ worktree เข้า port แล้วคืนตัวหลักเสมอ · ข้อมูลโปรเจกต์อยู่ใน `.claude/heavy-test.ini` |
 | [`diagnosing-bugs`](diagnosing-bugs/) | loop ไล่บั๊กยาก/performance regression ที่ root cause ยังไม่ชัด |
 | [`code-review`](code-review/) | รีวิว diff คู่ 2 แกน (coding standard + ตรงกับ spec ไหม) รันเป็น sub-agent คู่กัน |
 | [`resolving-merge-conflicts`](resolving-merge-conflicts/) | ไล่ merge/rebase conflict ที่ค้างอยู่ |

@@ -15,6 +15,11 @@ feature work. Two entry points:
 
 Seven steps, in order. Each ends red or green, plan or no plan — checkable, not vibes.
 
+**Project facts** — which agent takes which layer, which repos are siblings, what the evidence exit
+is — come from **`.claude/fix-bug.md`**, the first found walking up from the repo (a workspace of
+several repos keeps one at its root). Where it and this skill disagree, the file wins. No file →
+the generic defaults written below.
+
 ## 0. Confirm goal
 
 Invoke `grilling` before touching anything: state the bug as one falsifiable sentence — symptom,
@@ -27,6 +32,12 @@ executable; don't write it until the goal is settled.
 Write a test that reproduces the reported symptom before touching the fix. Run it: it must fail
 for the reported reason, not just fail. No repro test is possible (a pure UI/visual bug) → say so
 and move to Root.
+
+Certify it before any fix: read what it asserts against the step-0 sentence — an assert weaker
+than the goal (a success toast, not the saved row) lets a wrong fix go green. You certify; tell the
+user only about an assert that looks off. A certified test is **frozen**: the implementer changes
+code until it passes; a test that genuinely must change comes back to you with the reason, and you
+re-certify.
 
 ## 2. Root
 
@@ -53,7 +64,8 @@ this fix or splits into its own ticket (splits into `handoff` to write up).
 ## 4. Delegate
 
 A root cause + a plan is a fully-defined ticket — hand it to the specialist agent for that layer
-(`backend-dev`, `frontend-dev`, ...), the workspace's default for any fully-defined ticket.
+(`backend-dev`, `frontend-dev`, ...), the workspace's default for any fully-defined ticket. The
+brief names the frozen test file.
 
 Implement it yourself when the fix is small enough to finish in a handful of tool calls (≈5) —
 writing the fix and its test costs less than briefing an agent. Delegate everything past that size.
@@ -64,7 +76,19 @@ Run `/code-review`. Send findings back to whoever implemented the fix; they fix,
 repro test and the wider suite. Repeat until the review is clean and every test is green — done is
 "review ran clean," not "review ran."
 
+No cap on rounds. Two rounds failing for the same cause means Root was wrong: go back to step 2
+with that failure as evidence, rather than patching a third time.
+
+- **Flaky** — a test that passes and fails on the same code gets one rerun. Still unsure → name it
+  unstable and report `not proven` (step 6).
+- **Catch up** — once green, bring in the PR/MR's target branch and rerun. Not pushed yet → rebase
+  onto it. Already pushed (a follow-up into an open PR/MR) → merge it in, keeping the pushed
+  history intact. Red after → back into the loop.
+
 ## 6. Close
+
+Report one status, plus one line on what actually ran: `passed` · `not proven` (a gate couldn't
+run — environment down, missing fixture) · `failed` · `no code change`.
 
 Before handing off: any doc or feature-map fact this fix made wrong gets fixed now, on the spot —
 the workspace already tells you how; this is the checkpoint that stops it sliding to "later."

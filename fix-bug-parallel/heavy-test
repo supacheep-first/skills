@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""heavy-test — run heavy tests one at a time across parallel bug worktrees.
+
+Mechanics only. Every project fact (services, ports, commands) comes from the project's
+.claude/heavy-test.ini. Python 3.8+ stdlib, macOS and Linux. `heavy-test help` for usage.
+"""
+import configparser
+import fcntl
+import glob
+import hashlib
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+USAGE = """\
+heavy-test — run heavy tests one at a time across parallel bug worktrees.
+
+  heavy-test main up|down|status [service...]
+      Start / stop / show the main services, run from the main checkouts. Default: all.
+  heavy-test setup <worktree>...
+      Copy the gitignored files the config lists from the main checkout into each worktree,
+      then run the service's install command. Required once per worktree before `e2e`.
+  heavy-test e2e <worktree>... [-- <test args>]
+      Pass every worktree this bug changed. Each worktree's services replace the main ones on the
+      same ports; the `test` command of each passed service that has one runs in its worktree;
+      then the main services come back. Services of repos not passed stay on the main checkout.
+  heavy-test exec <dir> -- <command...>
+      Run any other heavy command (a full build, an integration suite) under the queue.
+
+Waiting in the queue has no time limit and prints who holds it every minute — run this in the
+background (Bash run_in_background), since a foreground call can be cut off at 10 minutes.
+
+The last line is the result:
+  RESULT: passed       exit 0
+  RESULT: failed       exit 1   tests ran and went red
+  RESULT: not proven   exit 3   a gate couldn't run (preflight failed, a port held by a process
+                                heavy-test didn't start, a service didn't boot, interrupted)
+
+Config: .claude/heavy-test.ini, the first found walking up from the current directory, plus
+.claude/heavy-test.local.ini beside it for machine-only overrides. State: ~/.cache/heavy-test/.
+"""
+
+
+def log(msg):
+    print("[heavy-test %s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+
+
+class NotProven(Exception):
+    pass
+
+
+class Interrupted(Exception):
+    pass
+
+
+# --- config --------------------------------------------------------------------------------------
+
+def git(cwd, *args):
+    r = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def main_checkout(path):
+    """Main worktree of the git repo holding `path` — the same dir when path is not a linked worktree."""
+    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common and os.path.basename(common) == ".git":
+        return os.path.realpath(os.path.dirname(common))
+    return None
+
+
+def find_config(start):
+    d = os.path.realpath(start)
+    while True:
+        p = os.path.join(d, ".claude", "heavy-test.ini")
+        if os.path.isfile(p):
+            return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+class Service:
+    def __init__(self, name, sec, root):
+        self.name = name
+        self.repo = os.path.realpath(os.path.join(root, sec.get("repo", ".")))
+        self.path = sec.get("path", "")
+        self.port = sec.getint("port")
+        self.build = sec.get("build")
+        self.start = sec.get("start")
+        self.stop = sec.get("stop")
+        self.health = sec.get("health")
+        self.ready = sec.get("ready")
+        self.env = sec.get("env", "")
+        self.test = sec.get("test")
+        self.copy = sec.get("copy", "").split()
+        self.install = sec.get("install")
+        self.timeout = sec.getint("boot_timeout", 300)
+        if not self.port or not self.start:
+            sys.exit("heavy-test: [service %s] needs `port` and `start`" % name)
+
+    def dir_in(self, checkout):
+        return os.path.join(checkout, self.path) if self.path else checkout
+
+
+class Project:
+    def __init__(self, cfg_path):
+        cfg_dir = os.path.dirname(os.path.dirname(cfg_path))
+        self.root = cfg_dir
+        top = git(cfg_dir, "rev-parse", "--show-toplevel")
+        if top and os.path.realpath(top) == os.path.realpath(cfg_dir):
+            self.root = main_checkout(cfg_dir) or cfg_dir  # config committed in a repo, read from a worktree
+        cp = configparser.ConfigParser(interpolation=None)
+        cp.read([cfg_path, os.path.join(os.path.dirname(cfg_path), "heavy-test.local.ini")])
+        p = cp["project"] if cp.has_section("project") else {}
+        self.main_branch = p.get("main_branch")
+        self.preflight = p.get("preflight")
+        self.command = p.get("command")
+        self.env = p.get("env", "")
+        self.services = []
+        for sec in cp.sections():
+            m = re.match(r"service\s+(\S+)$", sec)
+            if m:
+                self.services.append(Service(m.group(1), cp[sec], self.root))
+        digest = hashlib.sha1(self.root.encode()).hexdigest()[:8]
+        self.state = os.environ.get("HEAVY_TEST_STATE") or os.path.join(
+            os.path.expanduser("~/.cache/heavy-test"), "%s-%s" % (os.path.basename(self.root), digest))
+        for sub in ("pid", "stopped", "logs", "files", "setup"):
+            os.makedirs(os.path.join(self.state, sub), exist_ok=True)
+
+    def svc(self, name):
+        for s in self.services:
+            if s.name == name:
+                return s
+        sys.exit("heavy-test: no service named %r in the config" % name)
+
+    def services_of(self, worktree):
+        mc = main_checkout(worktree)
+        if not mc:
+            raise NotProven("%s is not inside a git checkout" % worktree)
+        found = [s for s in self.services if s.repo == mc]
+        if not found:
+            raise NotProven("%s belongs to %s, which no [service] in the config uses" % (worktree, mc))
+        return found
+
+    def expand(self, s, port=None):
+        if s is None:
+            return None
+        s = s.replace("{state}", self.state)
+        return s.replace("{port}", str(port)) if port is not None else s
+
+    def environ(self, extra="", port=None):
+        env = dict(os.environ)
+        for tok in shlex.split(self.expand(self.env + " " + extra, port)):
+            k, _, v = tok.partition("=")
+            env[k] = os.path.expandvars(v)
+        return env
+
+    def f(self, *parts):
+        return os.path.join(self.state, *parts)
+
+
+P = None  # the loaded Project
+
+
+# --- processes and ports -------------------------------------------------------------------------
+
+def listening(port):
+    for host in ("127.0.0.1", "::1"):
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def listener_pid(port):
+    if shutil.which("lsof"):
+        out = subprocess.run(["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN", "-t"],
+                             capture_output=True, text=True).stdout.split()
+        return int(out[0]) if out else None
+    if shutil.which("ss"):
+        m = re.search(r"pid=(\d+)", subprocess.run(["ss", "-ltnpH", "sport = :%d" % port],
+                                                   capture_output=True, text=True).stdout)
+        return int(m.group(1)) if m else None
+    return None
+
+
+def pgid_of(pid):
+    try:
+        return os.getpgid(pid)
+    except (ProcessLookupError, PermissionError):
+        return None
+
+
+def group_alive(g):
+    try:
+        os.killpg(g, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def describe(pid):
+    if pid is None:
+        return "an unknown process"
+    cmd = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+    return "pid %d: %s" % (pid, cmd.strip()[:100])
+
+
+def cwd_of(pid):
+    if os.path.isdir("/proc/%d" % pid):
+        try:
+            return os.readlink("/proc/%d/cwd" % pid)
+        except OSError:
+            return "?"
+    out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True).stdout
+    return next((l[1:] for l in out.splitlines() if l.startswith("n")), "?")
+
+
+def port_state(port, g):
+    """'free' | 'ours' (held by process group g) | 'other' — plus the listener pid when known."""
+    if not listening(port):
+        return "free", None
+    pid = listener_pid(port)
+    if pid is not None:
+        return ("ours" if g is not None and pgid_of(pid) == g else "other"), pid
+    return ("ours" if g is not None and group_alive(g) else "other"), None
+
+
+def spawn(cmd, cwd, env, logf):
+    """Start cmd as the leader of its own session, so it outlives heavy-test and dies as a group."""
+    with open(logf, "ab") as out:
+        return subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, env=env, stdout=out,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def run(cmd, cwd, env, logf=None):
+    """Run cmd to completion in its own group; an interrupt takes the whole group down with it."""
+    out = open(logf, "ab") if logf else None
+    p = subprocess.Popen(["/bin/sh", "-c", cmd], cwd=cwd, env=env, stdout=out,
+                         stderr=subprocess.STDOUT if out else None, start_new_session=True)
+    try:
+        return p.wait()
+    except BaseException:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise
+    finally:
+        if out:
+            out.close()
+
+
+def tail(logf, n=20):
+    try:
+        with open(logf, errors="replace") as fh:
+            for line in fh.readlines()[-n:]:
+                print("    " + line.rstrip())
+    except OSError:
+        pass
+
+
+_NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def is_up(svc, cwd):
+    """(up?, what the last check saw)"""
+    if svc.ready:
+        rc = run(P.expand(svc.ready, svc.port), cwd, P.environ(svc.env, svc.port), os.devnull)
+        return rc == 0, "ready command exit %d" % rc
+    if svc.health:
+        try:
+            with _NOPROXY.open(P.expand(svc.health, svc.port), timeout=3) as r:
+                return r.status < 400, "HTTP %d" % r.status
+        except urllib.error.HTTPError as e:
+            return False, "HTTP %d" % e.code
+        except Exception as e:
+            return False, type(e).__name__
+    return listening(svc.port), "port check"
+
+
+def wait_up(svc, proc, cwd, logf):
+    deadline, seen = time.time() + svc.timeout, "nothing"
+    while time.time() < deadline:
+        up, seen = is_up(svc, cwd)
+        if up:
+            return True
+        if proc.poll() is not None:
+            log("%s exited while booting — tail of %s:" % (svc.name, logf))
+            tail(logf)
+            return False
+        time.sleep(3)
+    log("%s not up on :%d after %ds (last check: %s) — log: %s" % (svc.name, svc.port, svc.timeout, seen, logf))
+    return False
+
+
+def stop_group(g, port, svc=None, cwd=None):
+    if svc is not None and svc.stop:
+        run(P.expand(svc.stop, port), cwd, P.environ(svc.env, port), os.devnull)
+    else:
+        try:
+            os.killpg(g, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(60):
+        if not listening(port):
+            return True
+        time.sleep(1)
+    try:
+        os.killpg(g, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    time.sleep(2)
+    return not listening(port)
+
+
+def read_rec(path):
+    try:
+        with open(path) as fh:
+            return fh.read().split()
+    except OSError:
+        return None
+
+
+# --- main services -------------------------------------------------------------------------------
+
+def main_pgid(svc):
+    rec = read_rec(P.f("pid", svc.name))
+    return int(rec[0]) if rec else None
+
+
+def refuse(svc, pid):
+    log("REFUSE: :%d is held by %s — not started by heavy-test" % (svc.port, describe(pid)))
+
+
+def start_main(svc, rebuild, retry=True):
+    state, pid = port_state(svc.port, main_pgid(svc))
+    if state == "ours":
+        log("%s already up on :%d" % (svc.name, svc.port))
+        return True
+    if state == "other":
+        refuse(svc, pid)
+        return False
+    d = svc.dir_in(svc.repo)
+    branch = git(svc.repo, "branch", "--show-current")
+    if P.main_branch and branch != P.main_branch:
+        log("WARNING: %s is on %r, not %s" % (svc.repo, branch, P.main_branch))
+    logf = P.f("logs", "main-%s.log" % svc.name)
+    env = P.environ(svc.env, svc.port)
+    if svc.build and rebuild:
+        log("building %s" % svc.name)
+        if run(P.expand(svc.build, svc.port), d, env, logf) != 0:
+            log("%s: build failed — log: %s" % (svc.name, logf))
+            return False
+    proc = spawn(P.expand(svc.start, svc.port), d, env, logf)
+    with open(P.f("pid", svc.name), "w") as fh:
+        fh.write("%d\n" % proc.pid)
+    if not wait_up(svc, proc, d, logf):
+        # bringing mains back is the promise; a dev server that came up broken gets one fresh start
+        if not retry:
+            return False
+        log("%s: restarting once" % svc.name)
+        if not stop_group(proc.pid, svc.port, svc, d):
+            return False
+        return start_main(svc, rebuild=False, retry=False)
+    head = git(svc.repo, "rev-parse", "--short", "HEAD")
+    log("%s up on :%d%s" % (svc.name, svc.port, " (%s on %s)" % (head, branch) if head else ""))
+    return True
+
+
+def stop_main(svc):
+    g = main_pgid(svc)
+    state, pid = port_state(svc.port, g)
+    if state == "other":
+        refuse(svc, pid)
+        return False
+    if state == "ours" and not stop_group(g, svc.port, svc, svc.dir_in(svc.repo)):
+        log("%s: :%d still held after stop" % (svc.name, svc.port))
+        return False
+    if state == "free" and g is not None and group_alive(g):
+        os.killpg(g, signal.SIGTERM)
+    if os.path.exists(P.f("pid", svc.name)):
+        os.remove(P.f("pid", svc.name))
+    if state == "ours":
+        log("%s stopped" % svc.name)
+    return True
+
+
+def status():
+    wt = {}
+    for path in glob.glob(P.f("pid", "wt-*")):
+        rec = read_rec(path)
+        if rec:
+            wt[int(rec[0])] = rec[2] if len(rec) > 2 else "?"
+    for svc in P.services:
+        state, pid = port_state(svc.port, main_pgid(svc))
+        if state == "free":
+            line = "down"
+        elif state == "ours":
+            line = "up (heavy-test%s)" % (", pid %d" % pid if pid else "")
+        elif pid is not None and pgid_of(pid) in wt:
+            line = "worktree from a run: %s" % wt[pgid_of(pid)]
+        else:
+            line = "HELD BY OTHER — %s" % describe(pid)
+        marker = read_rec(P.f("stopped", svc.name))
+        if marker is not None:
+            line += " · stopped by run: %s" % " ".join(marker)
+        print("%-12s :%-5d %s" % (svc.name, svc.port, line))
+    holder = read_rec(P.f("holder"))
+    fd = os.open(P.f("queue.lock"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        held = False
+    except BlockingIOError:
+        held = True
+    finally:
+        os.close(fd)
+    if held:
+        print("queue held by: %s" % (" ".join(holder) if holder else "?"))
+    elif holder:
+        print("queue: free (last holder died mid-run: %s — the next run repairs what it left)" % " ".join(holder))
+    else:
+        print("queue: free")
+
+
+# --- the queue -----------------------------------------------------------------------------------
+
+class Queue:
+    def __init__(self):
+        self.fd = None
+
+    def acquire(self, label):
+        self.fd = os.open(P.f("queue.lock"), os.O_RDWR | os.O_CREAT, 0o644)  # not inherited by children
+        waited = 0
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if waited % 60 == 0:
+                    holder = read_rec(P.f("holder"))
+                    log("waiting — queue held by: %s" % (" ".join(holder) if holder else "?"))
+                time.sleep(2)
+                waited += 2
+        with open(P.f("holder"), "w") as fh:
+            fh.write("%s · since %s · pid %d\n" % (label, time.strftime("%H:%M:%S"), os.getpid()))
+        log("queue acquired (%s)" % label)
+
+    def release(self):
+        if self.fd is None:
+            return
+        try:
+            os.remove(P.f("holder"))
+        except OSError:
+            pass
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+        self.fd = None
+        log("queue released")
+
+
+def repair():
+    """Undo whatever a run left behind: worktree services still up, main services still stopped."""
+    ok = True
+    for path in glob.glob(P.f("pid", "wt-*")):
+        rec = read_rec(path)
+        name = os.path.basename(path)[3:]
+        if rec and group_alive(int(rec[0])):
+            log("stopping worktree service %s" % name)
+            svc = next((s for s in P.services if s.name == name), None)
+            stop_group(int(rec[0]), int(rec[1]), svc, svc.dir_in(rec[2]) if svc and len(rec) > 2 else None)
+        os.remove(path)
+    for path in sorted(glob.glob(P.f("stopped", "*"))):
+        name = os.path.basename(path)
+        known = [s for s in P.services if s.name == name]
+        if not known:
+            log("WARNING: %s was stopped by a run but is no longer in the config" % name)
+            os.remove(path)
+            continue
+        log("restoring %s" % name)
+        if start_main(known[0], rebuild=False):
+            os.remove(path)
+        else:
+            ok = False
+    return ok
+
+
+def swap_in(svc, worktree, label):
+    """Put the worktree's build of svc on the port its main service held."""
+    state, pid = port_state(svc.port, main_pgid(svc))
+    if state == "other":
+        refuse(svc, pid)
+        raise NotProven(":%d is held by a process heavy-test didn't start" % svc.port)
+    if state == "ours":
+        with open(P.f("stopped", svc.name), "w") as fh:  # marker first: a crash after this is repairable
+            fh.write(label + "\n")
+        if not stop_main(svc):
+            os.remove(P.f("stopped", svc.name))
+            raise NotProven("could not stop main %s" % svc.name)
+    d = svc.dir_in(worktree)
+    logf = P.f("logs", "wt-%s-%s.log" % (os.path.basename(worktree), svc.name))
+    open(logf, "w").close()
+    env = P.environ(svc.env, svc.port)
+    if svc.build:
+        log("building %s in %s" % (svc.name, worktree))
+        if run(P.expand(svc.build, svc.port), d, env, logf) != 0:
+            tail(logf)
+            raise NotProven("%s build failed in %s — log: %s" % (svc.name, worktree, logf))
+    proc = spawn(P.expand(svc.start, svc.port), d, env, logf)
+    with open(P.f("pid", "wt-" + svc.name), "w") as fh:
+        fh.write("%d %d %s\n" % (proc.pid, svc.port, worktree))
+    if not wait_up(svc, proc, d, logf):
+        raise NotProven("worktree %s didn't boot — log: %s" % (svc.name, logf))
+    log("worktree %s up on :%d from %s" % (svc.name, svc.port, worktree))
+
+
+# --- commands ------------------------------------------------------------------------------------
+
+def preflight():
+    if P.preflight and run(P.expand(P.preflight), P.root, P.environ(), os.devnull) != 0:
+        raise NotProven("preflight failed: %s" % P.preflight)
+
+
+def preflight_after(what):
+    """Red tests on an environment that dropped mid-run prove nothing about the code."""
+    try:
+        preflight()
+    except NotProven as e:
+        raise NotProven("%s, and the environment dropped during the run (%s)" % (what, e))
+
+
+def setup_key(worktree):
+    return P.f("setup", hashlib.sha1(worktree.encode()).hexdigest()[:12])
+
+
+def cmd_setup(worktrees):
+    rc = 0
+    for wt in [os.path.realpath(w) for w in worktrees]:
+        try:
+            services = P.services_of(wt)
+        except NotProven as e:
+            log(str(e))
+            rc = 1
+            continue
+        mc = services[0].repo
+        if wt.startswith(mc + os.sep):  # worktrees kept inside the repo stay out of its git status
+            excl = os.path.join(mc, ".git", "info", "exclude")
+            entry = "/%s/" % os.path.relpath(os.path.dirname(wt), mc)
+            if os.path.isfile(excl) and entry not in open(excl).read().split():
+                with open(excl, "a") as fh:
+                    fh.write(entry + "\n")
+        installed, ok = set(), True
+        for svc in services:
+            src, dst = svc.dir_in(mc), svc.dir_in(wt)
+            for pattern in svc.copy:
+                hits = glob.glob(os.path.join(src, pattern))
+                if not hits:
+                    log("WARNING: %s matches nothing in %s" % (pattern, src))
+                for h in hits:
+                    target = os.path.join(dst, os.path.relpath(h, src))
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    shutil.copy2(h, target)
+                    log("copied %s" % os.path.relpath(target, wt))
+            if svc.install and dst not in installed:
+                installed.add(dst)
+                log("installing in %s" % dst)
+                if run(P.expand(svc.install, svc.port), dst, P.environ(svc.env, svc.port)) != 0:
+                    log("install failed in %s" % dst)
+                    ok = False
+        if ok:
+            open(setup_key(wt), "w").close()
+            log("%s ready" % wt)
+        else:
+            rc = 1
+    return rc
+
+
+def cmd_e2e(queue, args):
+    extra = []
+    if "--" in args:
+        i = args.index("--")
+        args, extra = args[:i], args[i + 1:]
+    if not args:
+        raise NotProven("no worktree given — usage: heavy-test e2e <worktree>... [-- <test args>]")
+    pairs = []
+    for wt in [os.path.realpath(w) for w in args]:
+        if not os.path.exists(setup_key(wt)):
+            raise NotProven("%s isn't set up — run: heavy-test setup %s" % (wt, wt))
+        pairs += [(svc, wt) for svc in P.services_of(wt)]
+    tests = [(svc, wt) for svc, wt in pairs if svc.test]
+    if not tests:
+        raise NotProven("none of the given worktrees has a service with a `test` command")
+    label = "e2e " + " + ".join(sorted({os.path.basename(wt) for _, wt in pairs}))
+    preflight()
+    queue.acquire(label)
+    if not repair():
+        raise NotProven("could not restore main services left by an earlier run")
+    for svc, wt in sorted(pairs, key=lambda p: bool(p[0].test)):  # services under test boot last
+        swap_in(svc, wt, label)
+    result = "passed"
+    for svc, wt in tests:
+        cmd = P.expand(svc.test, svc.port) + "".join(" " + shlex.quote(a) for a in extra)
+        log("running in %s: %s" % (svc.dir_in(wt), cmd))
+        if run(cmd, svc.dir_in(wt), P.environ()) != 0:
+            result = "failed"
+    if result == "failed":
+        preflight_after("the tests went red")
+    return result
+
+
+def cmd_exec(queue, args):
+    if len(args) < 3 or args[1] != "--":
+        raise NotProven("usage: heavy-test exec <dir> -- <command...>")
+    d = os.path.realpath(args[0])
+    preflight()
+    queue.acquire("exec %s" % os.path.basename(d))
+    cmd = " ".join(shlex.quote(a) for a in args[2:])
+    log("running in %s: %s" % (d, cmd))
+    if run(cmd, d, P.environ()) == 0:
+        return "passed"
+    preflight_after("the command failed")
+    return "failed"
+
+
+def cmd_main(args):
+    action = args[0] if args else None
+    if action == "status":
+        status()
+        return 0
+    if action not in ("up", "down"):
+        print(USAGE)
+        return 2
+    services = [P.svc(n) for n in args[1:]] or P.services
+    if action == "up":
+        try:
+            preflight()
+        except NotProven as e:
+            log(str(e))
+            return 3
+    queue = Queue()
+    rc = 0
+    with interrupts_raise():
+        try:
+            queue.acquire("main " + action)
+            for svc in services:
+                if action == "up":
+                    rc |= 0 if start_main(svc, rebuild=True) else 1
+                else:
+                    rc |= 0 if stop_main(svc) else 1
+                    if os.path.exists(P.f("stopped", svc.name)):
+                        os.remove(P.f("stopped", svc.name))
+        except Interrupted:
+            rc = 130
+        finally:
+            queue.release()
+    status()
+    return rc
+
+
+class interrupts_raise:
+    """Turn SIGINT/SIGTERM/SIGHUP into Interrupted inside the block, so cleanup still runs."""
+
+    def __enter__(self):
+        def handler(signum, frame):
+            raise Interrupted()
+        self.old = {s: signal.signal(s, handler) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+
+    def __exit__(self, *exc):
+        for s, h in self.old.items():
+            signal.signal(s, h)
+        return False
+
+
+def guarded(fn, args):
+    """Run a queued command; whatever happens, repair and release before printing RESULT."""
+    queue = Queue()
+    result, reason = None, ""
+    with interrupts_raise():
+        try:
+            result = fn(queue, args)
+        except NotProven as e:
+            result, reason = "not proven", str(e)
+        except Interrupted:
+            result, reason = "not proven", "interrupted"
+    for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        # cleanup must finish; a no-op handler, not SIG_IGN, which restored services would inherit
+        signal.signal(s, lambda signum, frame: None)
+    if queue.fd is not None:
+        if not repair():
+            result = "not proven"
+            reason = (reason + "; " if reason else "") + "main services not fully restored — run: heavy-test main status"
+        queue.release()
+    print("RESULT: %s%s" % (result, " — " + reason if reason else ""), flush=True)
+    return {"passed": 0, "failed": 1}.get(result, 3)
+
+
+def main(argv):
+    global P
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0 if argv else 2
+    cfg = find_config(os.getcwd())
+    if not cfg:
+        print("heavy-test: no .claude/heavy-test.ini found walking up from %s — the fix-bug-parallel "
+              "skill's 'Project file' section says how to write one" % os.getcwd(), file=sys.stderr)
+        return 2
+    P = Project(cfg)
+    if P.command:  # the project brings its own queue script, under the same contract
+        os.chdir(P.root)
+        os.execvp("/bin/sh", ["/bin/sh", "-c", P.command + ' "$@"', "heavy-test"] + argv)
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "main":
+        return cmd_main(rest)
+    if cmd == "setup":
+        return cmd_setup(rest)
+    if cmd == "e2e":
+        return guarded(cmd_e2e, rest)
+    if cmd == "exec":
+        return guarded(cmd_exec, rest)
+    print(USAGE)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
