@@ -20,6 +20,11 @@ is — come from **`.claude/fix-bug.md`**, the first found walking up from the r
 several repos keeps one at its root). Where it and this skill disagree, the file wins. No file →
 the generic defaults written below.
 
+**Stops** — the loop waits for the user at step 0's goal, step 3's plan, and wherever a skill or
+the project file asks for a yes (a PR/MR draft). Everywhere else it flows: the next step starts in
+the turn the previous one finishes, and a turn ends on a result, a question at one of those stops,
+or work still running — named, with where it stands (a queue position, an agent's task).
+
 ## 0. Confirm goal
 
 Invoke `grilling` before touching anything: state the bug as one falsifiable sentence — symptom,

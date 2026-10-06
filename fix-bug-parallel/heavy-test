@@ -26,17 +26,24 @@ heavy-test — run heavy tests one at a time across parallel bug worktrees.
   heavy-test main up|down|status [service...]
       Start / stop / show the main services, run from the main checkouts. Default: all.
   heavy-test setup <worktree>...
-      Copy the gitignored files the config lists from the main checkout into each worktree,
-      then run the service's install command. Required once per worktree before `e2e`.
-  heavy-test e2e <worktree>... [-- <test args>]
+      Copy the gitignored files the config lists (`copy`) from the main checkout into each
+      worktree, link its `share` paths to the main checkout's, then run the service's install
+      command. Required once per worktree before `e2e`.
+  heavy-test e2e <worktree>... [--before | --before-after] [-- <test args>]
       Pass every worktree this bug changed. Each worktree's services replace the main ones on the
       same ports; the `test` command of each passed service that has one runs in its worktree;
       then the main services come back. Services of repos not passed stay on the main checkout.
+      --before        run the worktree's tests against the main services only, nothing swapped
+                      (the repro going red before any fix)
+      --before-after  both, in one turn of the queue (before/after evidence nobody can cut into)
+      The tests see HEAVY_TEST_PHASE=before|after.
   heavy-test exec <dir> -- <command...>
       Run any other heavy command (a full build, an integration suite) under the queue.
 
-Waiting in the queue has no time limit and prints who holds it every minute — run this in the
-background (Bash run_in_background), since a foreground call can be cut off at 10 minutes.
+The queue is first come, first served. A waiting run prints its position, who is running and for
+how long, whenever that changes and at least every minute; `main status` shows the whole line.
+Waiting has no time limit — run this in the background (Bash run_in_background), since a
+foreground call can be cut off at 10 minutes.
 
 The last line is the result:
   RESULT: passed       exit 0
@@ -102,6 +109,7 @@ class Service:
         self.env = sec.get("env", "")
         self.test = sec.get("test")
         self.copy = sec.get("copy", "").split()
+        self.share = sec.get("share", "").split()
         self.install = sec.get("install")
         self.timeout = sec.getint("boot_timeout", 300)
         if not self.port or not self.start:
@@ -430,47 +438,121 @@ def status():
     finally:
         os.close(fd)
     if held:
-        print("queue held by: %s" % (" ".join(holder) if holder else "?"))
+        print("queue held by: %s" % (holder_line() or "?"))
     elif holder:
         print("queue: free (last holder died mid-run: %s — the next run repairs what it left)" % " ".join(holder))
     else:
         print("queue: free")
+    for i, (_, label, since) in enumerate(waiters()):
+        print("  %d. %s (waiting %s)" % (i + 1, label, clock(time.time() - since)))
 
 
 # --- the queue -----------------------------------------------------------------------------------
 
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def waiters():
+    """Live tickets in arrival order: [(path, label, since_epoch)]. Dead waiters' tickets are swept."""
+    out = []
+    for path in glob.glob(P.f("waiting", "*")):
+        try:
+            t, pid = (int(x) for x in os.path.basename(path).split("-"))
+        except ValueError:
+            continue
+        if not pid_alive(pid):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        label = " ".join(read_rec(path) or ["?"])
+        out.append((t, path, label))
+    return [(path, label, t / 1e9) for t, path, label in sorted(out)]
+
+
+def clock(seconds):
+    seconds = int(max(seconds, 0))
+    return "%d:%02d" % (seconds // 60, seconds % 60)
+
+
+def holder_line():
+    holder = read_rec(P.f("holder"))
+    if not holder:
+        return None
+    try:
+        ran = clock(time.time() - os.path.getmtime(P.f("holder")))
+    except OSError:
+        ran = "?"
+    return "%s (running %s)" % (" ".join(holder).split(" · ")[0], ran)
+
+
 class Queue:
+    """First come, first served: a ticket per waiter, the flock taken only by the oldest live ticket."""
+
     def __init__(self):
         self.fd = None
+        self.ticket = None
+        self.held = False  # only the holder may repair or release — a waiter interrupted in line just leaves
 
     def acquire(self, label):
+        os.makedirs(P.f("waiting"), exist_ok=True)
+        self.ticket = P.f("waiting", "%d-%d" % (time.time_ns(), os.getpid()))
+        with open(self.ticket, "w") as fh:
+            fh.write(label + "\n")
         self.fd = os.open(P.f("queue.lock"), os.O_RDWR | os.O_CREAT, 0o644)  # not inherited by children
-        waited = 0
+        shown, last = None, 0.0
         while True:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if waited % 60 == 0:
-                    holder = read_rec(P.f("holder"))
-                    log("waiting — queue held by: %s" % (" ".join(holder) if holder else "?"))
-                time.sleep(2)
-                waited += 2
+            line = [w for w in waiters()]
+            mine = next((i for i, w in enumerate(line) if w[0] == self.ticket), 0)
+            if mine == 0:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.held = True
+                    break
+                except BlockingIOError:
+                    pass
+            ahead = [w[1] for w in line[:mine]]
+            key = (mine, tuple(ahead), (read_rec(P.f("holder")) or [""])[0])
+            if key != shown or time.time() - last >= 60:
+                log("waiting — position %d · running: %s%s" % (
+                    mine + 1, holder_line() or "?", " · ahead: " + ", ".join(ahead) if ahead else ""))
+                shown, last = key, time.time()
+            time.sleep(2)
+        self.cancel()
         with open(P.f("holder"), "w") as fh:
             fh.write("%s · since %s · pid %d\n" % (label, time.strftime("%H:%M:%S"), os.getpid()))
         log("queue acquired (%s)" % label)
 
+    def cancel(self):
+        """Leave the line (after taking the queue, or when interrupted while waiting)."""
+        if self.ticket:
+            try:
+                os.remove(self.ticket)
+            except OSError:
+                pass
+            self.ticket = None
+
     def release(self):
+        self.cancel()
         if self.fd is None:
             return
-        try:
-            os.remove(P.f("holder"))
-        except OSError:
-            pass
-        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        if self.held:
+            try:
+                os.remove(P.f("holder"))
+            except OSError:
+                pass
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            log("queue released")
         os.close(self.fd)
-        self.fd = None
-        log("queue released")
+        self.fd, self.held = None, False
 
 
 def repair():
@@ -543,6 +625,45 @@ def preflight_after(what):
         raise NotProven("%s, and the environment dropped during the run (%s)" % (what, e))
 
 
+def ticket_of(worktree, svc):
+    """`<project root>/.worktrees/<repo>-<ticket>` → <ticket>"""
+    name, repo = os.path.basename(worktree), os.path.basename(svc.repo)
+    return name[len(repo) + 1:] if name.startswith(repo + "-") else name
+
+
+def link_shared(worktree):
+    """Each `share` path in a worktree is a link to the main checkout's, so whatever a run writes
+    there (test evidence) outlives the worktree. Anything already written inside moves over first."""
+    for svc in P.services_of(worktree):
+        for rel in svc.share:
+            rel = rel.replace("{ticket}", ticket_of(worktree, svc)).rstrip("/")
+            main_path = os.path.join(svc.dir_in(svc.repo), rel)
+            wt_path = os.path.join(svc.dir_in(worktree), rel)
+            if os.path.islink(wt_path) and os.path.realpath(wt_path) == os.path.realpath(main_path):
+                continue
+            if git(svc.dir_in(worktree), "ls-files", "--", rel):  # replacing tracked files would delete them
+                log("WARNING: share %s holds tracked files in %s — left as is" % (rel, worktree))
+                continue
+            os.makedirs(main_path, exist_ok=True)
+            if os.path.islink(wt_path):
+                os.remove(wt_path)
+            elif os.path.isdir(wt_path):
+                shutil.copytree(wt_path, main_path, dirs_exist_ok=True)
+                shutil.rmtree(wt_path)
+                log("moved what %s held in %s into the main checkout" % (os.path.basename(worktree), rel))
+            os.makedirs(os.path.dirname(wt_path), exist_ok=True)
+            os.symlink(main_path, wt_path)
+            log("%s/%s → %s" % (os.path.basename(worktree), rel, main_path))
+            # a `dir/` ignore pattern doesn't match a symlink — exclude the link itself, repo-locally
+            if git(svc.dir_in(worktree), "check-ignore", "-q", rel) is None:
+                common = git(worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                entry = "/" + os.path.relpath(wt_path, worktree)
+                excl = os.path.join(common, "info", "exclude")
+                os.makedirs(os.path.dirname(excl), exist_ok=True)
+                with open(excl, "a") as fh:
+                    fh.write(entry + "\n")
+
+
 def setup_key(worktree):
     return P.f("setup", hashlib.sha1(worktree.encode()).hexdigest()[:12])
 
@@ -581,6 +702,7 @@ def cmd_setup(worktrees):
                 if run(P.expand(svc.install, svc.port), dst, P.environ(svc.env, svc.port)) != 0:
                     log("install failed in %s" % dst)
                     ok = False
+        link_shared(wt)
         if ok:
             open(setup_key(wt), "w").close()
             log("%s ready" % wt)
@@ -589,36 +711,67 @@ def cmd_setup(worktrees):
     return rc
 
 
+def run_tests(tests, extra, phase):
+    """Each test command, from its worktree, with HEAVY_TEST_PHASE telling the spec which side it's on."""
+    result = "passed"
+    for svc, wt in tests:
+        cmd = P.expand(svc.test, svc.port) + "".join(" " + shlex.quote(a) for a in extra)
+        env = P.environ()
+        env["HEAVY_TEST_PHASE"] = phase
+        log("%s — running in %s: %s" % (phase, svc.dir_in(wt), cmd))
+        if run(cmd, svc.dir_in(wt), env) != 0:
+            result = "failed"
+    log("%s: %s" % (phase, result))
+    return result
+
+
 def cmd_e2e(queue, args):
     extra = []
     if "--" in args:
         i = args.index("--")
         args, extra = args[:i], args[i + 1:]
+    phases = ["after"]
+    for flag, chosen in (("--before-after", ["before", "after"]), ("--before", ["before"])):
+        if flag in args:
+            args.remove(flag)
+            phases = chosen
     if not args:
-        raise NotProven("no worktree given — usage: heavy-test e2e <worktree>... [-- <test args>]")
+        raise NotProven("no worktree given — usage: heavy-test e2e <worktree>... [--before|--before-after] [-- <test args>]")
     pairs = []
     for wt in [os.path.realpath(w) for w in args]:
         if not os.path.exists(setup_key(wt)):
             raise NotProven("%s isn't set up — run: heavy-test setup %s" % (wt, wt))
         pairs += [(svc, wt) for svc in P.services_of(wt)]
+        link_shared(wt)
     tests = [(svc, wt) for svc, wt in pairs if svc.test]
     if not tests:
         raise NotProven("none of the given worktrees has a service with a `test` command")
     label = "e2e " + " + ".join(sorted({os.path.basename(wt) for _, wt in pairs}))
+    if phases != ["after"]:
+        label += " (%s)" % "+".join(phases)
     preflight()
     queue.acquire(label)
     if not repair():
         raise NotProven("could not restore main services left by an earlier run")
-    for svc, wt in sorted(pairs, key=lambda p: bool(p[0].test)):  # services under test boot last
-        swap_in(svc, wt, label)
-    result = "passed"
-    for svc, wt in tests:
-        cmd = P.expand(svc.test, svc.port) + "".join(" " + shlex.quote(a) for a in extra)
-        log("running in %s: %s" % (svc.dir_in(wt), cmd))
-        if run(cmd, svc.dir_in(wt), P.environ()) != 0:
-            result = "failed"
-    if result == "failed":
+    results = {}
+    if "before" in phases:  # the main checkouts' code, tested by the worktree's spec — nothing swapped
+        for svc, _ in pairs:
+            state, pid = port_state(svc.port, main_pgid(svc))
+            if state == "other":
+                refuse(svc, pid)
+                raise NotProven(":%d is held by a process heavy-test didn't start" % svc.port)
+            if state == "free" and not start_main(svc, rebuild=False):
+                raise NotProven("main %s isn't up — run: heavy-test main up %s" % (svc.name, svc.name))
+        results["before"] = run_tests(tests, extra, "before")
+    if "after" in phases:
+        for svc, wt in sorted(pairs, key=lambda p: bool(p[0].test)):  # services under test boot last
+            swap_in(svc, wt, label)
+        results["after"] = run_tests(tests, extra, "after")
+    result = results[phases[-1]]
+    if "failed" in results.values():
         preflight_after("the tests went red")
+    if len(phases) == 2:
+        return result, "before: %s · after: %s" % (results["before"], results["after"])
     return result
 
 
@@ -666,7 +819,7 @@ def cmd_main(args):
         except Interrupted:
             rc = 130
         finally:
-            queue.release()
+            queue.release()  # also leaves the line when interrupted while waiting
     status()
     return rc
 
@@ -692,6 +845,8 @@ def guarded(fn, args):
     with interrupts_raise():
         try:
             result = fn(queue, args)
+            if isinstance(result, tuple):
+                result, reason = result
         except NotProven as e:
             result, reason = "not proven", str(e)
         except Interrupted:
@@ -699,7 +854,8 @@ def guarded(fn, args):
     for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         # cleanup must finish; a no-op handler, not SIG_IGN, which restored services would inherit
         signal.signal(s, lambda signum, frame: None)
-    if queue.fd is not None:
+    queue.cancel()
+    if queue.held:
         if not repair():
             result = "not proven"
             reason = (reason + "; " if reason else "") + "main services not fully restored — run: heavy-test main status"

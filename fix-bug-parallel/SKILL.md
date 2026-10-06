@@ -21,10 +21,11 @@ what changes when other bugs run beside yours.
   It owns the main services: starts them, records their process groups, swaps a worktree's build
   onto the ports a run needs, and brings the mains back before releasing the queue.
 
-**Fast** — run any time, in your worktree: typecheck, lint, format, a unit test that touches
-nothing shared. A test that starts its own server on a free port (port 0) is fast too.
-**Heavy** — anything that needs a fixed port, the running app, or a shared database: e2e,
-integration suites, a full build. Heavy runs only through the queue.
+**Fast** — run any time, in your worktree: typecheck, lint, format, and any build or test suite
+that touches nothing shared — in-memory database, servers on a free port (port 0). Most full
+builds are fast; check what their tests touch before queueing one.
+**Heavy** — a test that needs a fixed port, the running app, or a shared database: e2e, and
+integration suites against real services. Heavy runs only through the queue.
 
 ## Project file
 
@@ -38,7 +39,7 @@ No file → build it with the user before step 1:
 1. Find each service the heavy tests need running — dev-server scripts, framework defaults, the
    app's own config, a compose file — with its port, start command, and a URL that answers 200
    once it's ready. Find the gitignored files a fresh checkout needs to run
-   (`git status --ignored`).
+   (`git status --ignored`), and where test evidence is written (that becomes `share`).
 2. Draft the file from `heavy-test.example.ini` in this skill's directory and show it.
 3. On the user's yes, write it and run `heavy-test main up`. Done when `heavy-test main status`
    shows every service up.
@@ -53,13 +54,25 @@ A project the script can't express brings its own queue under the same contract 
   (an absolute path: `git -C` resolves a relative one inside the repo), then
   `heavy-test setup <worktree>`. Done when the setup prints `ready`. Root or Plan shows another
   repo is touched → set up its worktree the same way, same branch name.
-- **1, 5 — heavy tests go through the queue:** `heavy-test e2e <worktree>... -- <test args>`,
-  passing every worktree this bug changed; repos not passed stay on their main services. Run it in
-  the background — the queue may wait.
+- **1 — the repro goes red against the main services:** `heavy-test e2e <worktree> --before --
+  <spec>`. Nothing is swapped — before the fix, the worktree's code is the main code plus the test.
+- **5 — heavy tests go through the queue:** `heavy-test e2e <worktree>... -- <test args>`,
+  passing every worktree this bug changed; repos not passed stay on their main services.
+- **Waiting is not a stop.** Every queued run goes in the background; the session is resumed when
+  `RESULT:` lands. Meanwhile each turn ends on what you wait for and the queue position the run
+  printed (`heavy-test main status` shows the whole line) — then act on the result when it comes.
 - **4 — the brief** carries the absolute path of each worktree and of `heavy-test`; the agent works
   inside those paths.
 - **5 — cross-bug data.** A test that goes red in the loop but green run alone points first at data
   another bug's run left in the shared database: report `not proven` naming the test, rather than
   changing code.
+- **6 — evidence outlives the worktree.** Before/after evidence comes from one queue turn:
+  `heavy-test e2e <worktree>... --before-after -- <spec>`; the spec reads `HEAVY_TEST_PHASE`
+  (`before`/`after`) to name what it captures. The evidence folder is a `share` path in the
+  project file: inside a worktree it's a link to the main checkout's, so writing it by its
+  repo-relative path lands in the main checkout. Anything else that must outlive the bug and
+  isn't committed goes under a `share` path too.
 - **6 — clean up** this bug's worktrees and branches in safe mode (`git worktree remove`,
-  `git branch -d`); report anything git refuses.
+  `git branch -d`); report anything git refuses. `git worktree remove` deletes gitignored files
+  without asking, so first `git -C <worktree> status --short --ignored` must list nothing but
+  build output, installed dependencies and the `share` links.

@@ -11,9 +11,15 @@ command = ./scripts/my-queue
 project root. The skill only ever talks to `heavy-test`, so your script must keep its promises:
 
 - **Same commands** — `main up|down|status [service...]`, `setup <worktree>...`,
-  `e2e <worktree>... [-- <test args>]`, `exec <dir> -- <command...>`.
-- **One at a time** — at most one `e2e`/`exec`/`main up|down` holds the machine at once, across
-  every session; the rest wait without a time limit and say every minute who holds it.
+  `e2e <worktree>... [--before | --before-after] [-- <test args>]`, `exec <dir> -- <command...>`.
+  `--before` tests against the main services with nothing swapped; `--before-after` runs both
+  sides in one turn of the queue; tests see `HEAVY_TEST_PHASE=before|after`.
+- **One at a time, in arrival order** — at most one `e2e`/`exec`/`main up|down` holds the machine
+  across every session; the rest wait without a time limit, first come first served, printing
+  their position and who is running. A waiter interrupted in line just leaves it — only the holder
+  repairs or releases.
+- **Evidence outlives worktrees** — `setup` makes each configured shared path in a worktree point
+  at the main checkout's, never replacing tracked files.
 - **Mains always come back** — every main service a run stopped is running again before the queue
   is released: on success, on failure, on interrupt.
 - **Crashes are repaired** — a run killed outright leaves records; the next run that takes the
