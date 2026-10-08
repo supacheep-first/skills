@@ -8,6 +8,7 @@ import configparser
 import fcntl
 import glob
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -37,6 +38,13 @@ heavy-test — run heavy tests one at a time across parallel bug worktrees.
                       (the repro going red before any fix)
       --before-after  both, in one turn of the queue (before/after evidence nobody can cut into)
       The tests see HEAVY_TEST_PHASE=before|after.
+  heavy-test hold <worktree>... [--before -- <test args>]
+      Take the queue, swap the worktrees in, and keep them: every `e2e` on those worktrees then
+      runs at once — no queue, no swap — until `heavy-test release`, or until no test has run for
+      `hold_idle_minutes` (default 10). --before runs the tests on the main services first.
+      For a run of many tries (DoD evidence); others wait while it's held.
+  heavy-test release
+      End this machine's hold: worktree services stop, main services come back, the queue moves on.
   heavy-test exec <dir> -- <command...>
       Run any other heavy command (a full build, an integration suite) under the queue.
 
@@ -133,6 +141,7 @@ class Project:
         self.preflight = p.get("preflight")
         self.command = p.get("command")
         self.env = p.get("env", "")
+        self.hold_idle = int(p.get("hold_idle_minutes", "10")) * 60
         self.services = []
         for sec in cp.sections():
             m = re.match(r"service\s+(\S+)$", sec)
@@ -491,7 +500,13 @@ def holder_line():
         ran = clock(time.time() - os.path.getmtime(P.f("holder")))
     except OSError:
         ran = "?"
-    return "%s (running %s)" % (" ".join(holder).split(" · ")[0], ran)
+    name = " ".join(holder).split(" · ")[0]
+    hold = active_hold()
+    if hold:
+        idle = hold_idle()
+        return "%s (held %s · idle %s · auto-release in %s unless used)" % (
+            name, ran, clock(idle), clock(P.hold_idle - idle))
+    return "%s (running %s)" % (name, ran)
 
 
 class Queue:
@@ -725,7 +740,8 @@ def run_tests(tests, extra, phase):
     return result
 
 
-def cmd_e2e(queue, args):
+def parse_run(args):
+    """`<worktree>... [--before|--before-after] [-- <test args>]` → (worktrees, phases, pairs, tests, extra)"""
     extra = []
     if "--" in args:
         i = args.index("--")
@@ -736,36 +752,57 @@ def cmd_e2e(queue, args):
             args.remove(flag)
             phases = chosen
     if not args:
-        raise NotProven("no worktree given — usage: heavy-test e2e <worktree>... [--before|--before-after] [-- <test args>]")
-    pairs = []
-    for wt in [os.path.realpath(w) for w in args]:
+        raise NotProven("no worktree given — usage: heavy-test e2e|hold <worktree>... [--before|--before-after] [-- <test args>]")
+    worktrees, pairs = [os.path.realpath(w) for w in args], []
+    for wt in worktrees:
         if not os.path.exists(setup_key(wt)):
             raise NotProven("%s isn't set up — run: heavy-test setup %s" % (wt, wt))
         pairs += [(svc, wt) for svc in P.services_of(wt)]
         link_shared(wt)
     tests = [(svc, wt) for svc, wt in pairs if svc.test]
+    return worktrees, phases, pairs, tests, extra
+
+
+def name_of(pairs):
+    return " + ".join(sorted({os.path.basename(wt) for _, wt in pairs}))
+
+
+def run_before(pairs, tests, extra):
+    """The main checkouts' code, tested by the worktree's spec — nothing swapped."""
+    for svc, _ in pairs:
+        state, pid = port_state(svc.port, main_pgid(svc))
+        if state == "other":
+            refuse(svc, pid)
+            raise NotProven(":%d is held by a process heavy-test didn't start" % svc.port)
+        if state == "free" and not start_main(svc, rebuild=False):
+            raise NotProven("main %s isn't up — run: heavy-test main up %s" % (svc.name, svc.name))
+    return run_tests(tests, extra, "before")
+
+
+def swap_all(pairs, label):
+    for svc, wt in sorted(pairs, key=lambda p: bool(p[0].test)):  # services under test boot last
+        swap_in(svc, wt, label)
+
+
+def cmd_e2e(queue, args):
+    worktrees, phases, pairs, tests, extra = parse_run(args)
     if not tests:
         raise NotProven("none of the given worktrees has a service with a `test` command")
-    label = "e2e " + " + ".join(sorted({os.path.basename(wt) for _, wt in pairs}))
-    if phases != ["after"]:
-        label += " (%s)" % "+".join(phases)
+    hold = active_hold()
+    if hold and set(worktrees) <= set(hold["worktrees"]):
+        return run_held(tests, extra, phases)
+    if hold and set(worktrees) & set(hold["worktrees"]):
+        raise NotProven("this bug holds %s — release it first: heavy-test release" % hold["label"])
+    label = "e2e " + name_of(pairs) + (" (%s)" % "+".join(phases) if phases != ["after"] else "")
     preflight()
     queue.acquire(label)
     if not repair():
         raise NotProven("could not restore main services left by an earlier run")
     results = {}
-    if "before" in phases:  # the main checkouts' code, tested by the worktree's spec — nothing swapped
-        for svc, _ in pairs:
-            state, pid = port_state(svc.port, main_pgid(svc))
-            if state == "other":
-                refuse(svc, pid)
-                raise NotProven(":%d is held by a process heavy-test didn't start" % svc.port)
-            if state == "free" and not start_main(svc, rebuild=False):
-                raise NotProven("main %s isn't up — run: heavy-test main up %s" % (svc.name, svc.name))
-        results["before"] = run_tests(tests, extra, "before")
+    if "before" in phases:
+        results["before"] = run_before(pairs, tests, extra)
     if "after" in phases:
-        for svc, wt in sorted(pairs, key=lambda p: bool(p[0].test)):  # services under test boot last
-            swap_in(svc, wt, label)
+        swap_all(pairs, label)
         results["after"] = run_tests(tests, extra, "after")
     result = results[phases[-1]]
     if "failed" in results.values():
@@ -773,6 +810,156 @@ def cmd_e2e(queue, args):
     if len(phases) == 2:
         return result, "before: %s · after: %s" % (results["before"], results["after"])
     return result
+
+
+# --- hold: one swap, many runs -------------------------------------------------------------------
+
+def active_hold():
+    """The live hold, if any: {pid, label, worktrees}. A hold whose holder died is no hold."""
+    try:
+        with open(P.f("hold.json")) as fh:
+            h = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return h if pid_alive(h.get("pid", 0)) else None
+
+
+def hold_idle():
+    try:
+        return time.time() - os.path.getmtime(P.f("hold-used"))
+    except OSError:
+        return 0.0
+
+
+def touch_used():
+    with open(P.f("hold-used"), "a"):
+        os.utime(P.f("hold-used"))
+
+
+def run_held(tests, extra, phases):
+    """Tests straight on the services the hold already swapped in — no queue, no swap."""
+    if "before" in phases:
+        raise NotProven("the main services are swapped out while held — take `before` with "
+                        "`heavy-test hold … --before`, or release first")
+    busy = P.f("hold-busy-%d" % os.getpid())  # an idle clock never runs out under a running test
+    open(busy, "w").close()
+    touch_used()
+    try:
+        result = run_tests(tests, extra, "after")
+    finally:
+        os.remove(busy)
+        touch_used()
+    if result == "failed":
+        preflight_after("the tests went red")
+    return result
+
+
+def hold_busy():
+    for path in glob.glob(P.f("hold-busy-*")):
+        try:
+            if pid_alive(int(path.rsplit("-", 1)[1])):
+                return True
+        except ValueError:
+            pass
+        os.remove(path)
+    return False
+
+
+def cmd_hold_daemon(queue, args):
+    """Runs detached: take the queue, swap the worktrees in, keep them until `release` or idle."""
+    worktrees, phases, pairs, tests, extra = parse_run(args)
+    label = "hold " + name_of(pairs)
+    preflight()
+    queue.acquire(label)
+    if not repair():
+        raise NotProven("could not restore main services left by an earlier run")
+    if "before" in phases:
+        if not tests:
+            raise NotProven("--before needs a worktree whose service has a `test` command")
+        run_before(pairs, tests, extra)
+    swap_all(pairs, label)
+    for path in (P.f("hold-release"),):
+        if os.path.exists(path):
+            os.remove(path)
+    touch_used()
+    with open(P.f("hold.json"), "w") as fh:
+        json.dump({"pid": os.getpid(), "label": label, "worktrees": worktrees}, fh)
+    log("HELD — run tests with `heavy-test e2e %s -- <args>`; `heavy-test release` when done "
+        "(auto-release after %d min unused)" % (" ".join(worktrees), P.hold_idle // 60))
+    try:
+        while True:
+            time.sleep(3)
+            if os.path.exists(P.f("hold-release")):
+                log("release asked")
+                break
+            if not hold_busy() and hold_idle() >= P.hold_idle:
+                log("unused for %s — releasing" % clock(hold_idle()))
+                break
+    finally:
+        for path in (P.f("hold.json"), P.f("hold-release")):
+            if os.path.exists(path):
+                os.remove(path)
+    return "passed", "released"
+
+
+def cmd_hold(args):
+    """Start the detached holder and follow its log until it holds (or fails)."""
+    try:
+        worktrees, _, _, _, _ = parse_run(list(args))
+    except NotProven as e:
+        print("RESULT: not proven — %s" % e)
+        return 3
+    hold = active_hold()
+    if hold and set(worktrees) <= set(hold["worktrees"]):
+        touch_used()
+        print("RESULT: held — already (%s)" % hold["label"])
+        return 0
+    if hold and set(worktrees) & set(hold["worktrees"]):
+        print("RESULT: not proven — this bug holds %s — release it first" % hold["label"])
+        return 3
+    logf = P.f("logs", "hold-%d.log" % time.time())
+    with open(logf, "ab") as out:
+        child = subprocess.Popen([sys.executable, os.path.realpath(__file__), "_hold"] + list(args),
+                                 stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                 start_new_session=True)
+    seen = 0
+    with interrupts_raise():
+        try:
+            while True:
+                with open(logf, errors="replace") as fh:
+                    lines = fh.readlines()
+                for line in lines[seen:]:
+                    print(line.rstrip(), flush=True)
+                seen = len(lines)
+                h = active_hold()
+                if h and h["pid"] == child.pid:
+                    print("RESULT: held — %s" % h["label"], flush=True)
+                    return 0
+                if child.poll() is not None:
+                    with open(logf, errors="replace") as fh:
+                        for line in fh.readlines()[seen:]:
+                            print(line.rstrip())
+                    return 3
+                time.sleep(1)
+        except Interrupted:
+            os.kill(child.pid, signal.SIGTERM)  # it leaves the line, or repairs if it got that far
+            child.wait()
+            print("RESULT: not proven — interrupted")
+            return 3
+
+
+def cmd_release(args):
+    hold = active_hold()
+    if not hold:
+        print("nothing held")
+        status()
+        return 0
+    open(P.f("hold-release"), "w").close()
+    log("releasing %s" % hold["label"])
+    while pid_alive(hold["pid"]):
+        time.sleep(1)
+    status()
+    return 0
 
 
 def cmd_exec(queue, args):
@@ -887,6 +1074,12 @@ def main(argv):
         return guarded(cmd_e2e, rest)
     if cmd == "exec":
         return guarded(cmd_exec, rest)
+    if cmd == "hold":
+        return cmd_hold(rest)
+    if cmd == "_hold":
+        return guarded(cmd_hold_daemon, rest)
+    if cmd == "release":
+        return cmd_release(rest)
     print(USAGE)
     return 2
 

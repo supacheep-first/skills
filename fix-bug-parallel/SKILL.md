@@ -66,9 +66,11 @@ A project the script can't express brings its own queue under the same contract 
 - **5 — cross-bug data.** A test that goes red in the loop but green run alone points first at data
   another bug's run left in the shared database: report `not proven` naming the test, rather than
   changing code.
-- **6 — evidence outlives the worktree.** Before/after evidence comes from one queue turn:
-  `heavy-test e2e <worktree>... --before-after -- <spec>`; the spec reads `HEAVY_TEST_PHASE`
-  (`before`/`after`) to name what it captures. The evidence folder is a `share` path in the
+- **6 — evidence takes one hold, not one swap per try.** `heavy-test hold <worktree>... --before
+  -- <spec>` takes the queue, runs the spec on the main code (`before`), and swaps the worktrees
+  in; every `heavy-test e2e <worktree>... -- <spec>` after that runs at once on them (`after`),
+  however many tries the evidence needs; `heavy-test release` ends it — unused for 10 minutes, it
+  ends itself. The spec reads `HEAVY_TEST_PHASE` (`before`/`after`) to name what it captures. The evidence folder is a `share` path in the
   project file: inside a worktree it's a link to the main checkout's, so writing it by its
   repo-relative path lands in the main checkout. Anything else that must outlive the bug and
   isn't committed goes under a `share` path too.

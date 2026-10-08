@@ -14,6 +14,9 @@ project root. The skill only ever talks to `heavy-test`, so your script must kee
   `e2e <worktree>... [--before | --before-after] [-- <test args>]`, `exec <dir> -- <command...>`.
   `--before` tests against the main services with nothing swapped; `--before-after` runs both
   sides in one turn of the queue; tests see `HEAVY_TEST_PHASE=before|after`.
+  `hold <worktree>... [--before -- <test args>]` takes the queue and keeps the worktrees swapped
+  in; `e2e` on those worktrees then runs at once, with no queue and no swap; `release` ends the
+  hold, and a hold no test has used for `hold_idle_minutes` ends itself.
 - **One at a time, in arrival order** — at most one `e2e`/`exec`/`main up|down` holds the machine
   across every session; the rest wait without a time limit, first come first served, printing
   their position and who is running. A waiter interrupted in line just leaves it — only the holder
