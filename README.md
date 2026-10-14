@@ -56,6 +56,15 @@ Claude Code skills ของฉัน เก็บรวมไว้ที่น
 
 [`commands/`](commands/) — slash command ทั้งโฟลเดอร์ (`/tldr`, `/eli5`, `/compare`, ...) symlink ทั้งโฟลเดอร์ไปที่ `~/.claude/commands` รายการเต็มอยู่ใน [`commands/README.md`](commands/README.md)
 
+## agents
+
+[`agents/`](agents/) — subagent กลาง symlink ทั้งโฟลเดอร์ไปที่ `~/.claude/agents` · ส่วนเฉพาะโปรเจกต์ไม่อยู่ที่นี่ — agent อ่าน `.claude/agent-notes/<name>.md` ของโปรเจกต์เองถ้ามี
+โปรเจกต์ที่มี `.claude/agents/<name>.md` ชื่อเดียวกัน = ตัวในโปรเจกต์ชนะ ตัวกลางไม่ถูกเรียกเลย
+
+| agent | ทำอะไร |
+|---|---|
+| [`frontend-dev`](agents/frontend-dev.md) | ลงมือทำใบงาน frontend ที่นิยามครบแล้ว — ponytail + AGENTS.md, ตั้งชื่อ element ให้ e2e เรียกได้ |
+
 ## sync เข้าเครื่องใหม่
 
 ```bash
@@ -68,6 +77,7 @@ for name in ponytail pordee pordee-adhd trim-context \
   ln -s ~/.local/share/skills/$name ~/.claude/skills/$name
 done
 ln -s ~/.local/share/skills/commands ~/.claude/commands   # ถ้ามี ~/.claude/commands อยู่แล้ว ย้ายออกก่อน ไม่งั้น link จะไปซ้อนข้างใน
+ln -s ~/.local/share/skills/agents ~/.claude/agents       # เหมือนกัน
 ```
 
 แก้ skill ที่ `~/.local/share/skills/<name>` แล้ว commit/push ตามปกติ — `~/.claude/skills/<name>` เป็น symlink ตามไปเห็นทันที (command ก็เหมือนกัน ที่ `commands/`)
