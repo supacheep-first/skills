@@ -52,6 +52,10 @@ Claude Code skills ของฉัน เก็บรวมไว้ที่น
 
 ไม่รวม: `ego-browser` (มาคู่กับแอป ego lite เอง ไม่ใช่ package แยก) และ `synced` (เป็น cache/bucket dir ของเครื่องมือ sync ไม่ใช่ skill)
 
+## commands
+
+[`commands/`](commands/) — slash command ทั้งโฟลเดอร์ (`/tldr`, `/eli5`, `/compare`, ...) symlink ทั้งโฟลเดอร์ไปที่ `~/.claude/commands` รายการเต็มอยู่ใน [`commands/README.md`](commands/README.md)
+
 ## sync เข้าเครื่องใหม่
 
 ```bash
@@ -63,6 +67,7 @@ for name in ponytail pordee pordee-adhd trim-context \
             diagram-design last30days wait-what; do
   ln -s ~/.local/share/skills/$name ~/.claude/skills/$name
 done
+ln -s ~/.local/share/skills/commands ~/.claude/commands   # ถ้ามี ~/.claude/commands อยู่แล้ว ย้ายออกก่อน ไม่งั้น link จะไปซ้อนข้างใน
 ```
 
-แก้ skill ที่ `~/.local/share/skills/<name>` แล้ว commit/push ตามปกติ — `~/.claude/skills/<name>` เป็น symlink ตามไปเห็นทันที
+แก้ skill ที่ `~/.local/share/skills/<name>` แล้ว commit/push ตามปกติ — `~/.claude/skills/<name>` เป็น symlink ตามไปเห็นทันที (command ก็เหมือนกัน ที่ `commands/`)
