@@ -1,6 +1,6 @@
 ---
 name: fix-bug
-description: Fix bug loop — confirm the goal with the user, reproduce with a failing test, find root cause, plan the fix, delegate to a specialist agent, review, loop to green, then hand off for DoD evidence or a live test. Use when the user reports a concrete bug (repro steps, a ticket, a hotfix branch) and wants it fixed and shipped, or when a bug turns up mid-session during other work — not for open-ended diagnosis (diagnosing-bugs) or a trivial one-line fix.
+description: Fix bug loop — confirm the goal with the user, reproduce with a failing test, find root cause, plan the fix, turn every rule branch into a red test, delegate to a specialist agent, review, loop to green, then hand off for DoD evidence or a live test. Use when the user reports a concrete bug (repro steps, a ticket, a hotfix branch) and wants it fixed and shipped, or when a bug turns up mid-session during other work — not for open-ended diagnosis (diagnosing-bugs) or a trivial one-line fix.
 ---
 
 # fix-bug
@@ -13,7 +13,7 @@ feature work. Two entry points:
   work. Still open with 0, then skip straight to 3; write the repro test alongside or after the fix
   instead of before it.
 
-Seven steps, in order. Each ends red or green, plan or no plan — checkable, not vibes.
+Eight steps, in order. Each ends red or green, plan or no plan — checkable, not vibes.
 
 **Project facts** — which agent takes which layer, which repos are siblings, what the evidence exit
 is — come from **`.claude/fix-bug.md`**, the first found walking up from the repo (a workspace of
@@ -40,9 +40,8 @@ and move to Root.
 
 Certify it before any fix: read what it asserts against the step-0 sentence — an assert weaker
 than the goal (a success toast, not the saved row) lets a wrong fix go green. You certify; tell the
-user only about an assert that looks off. A certified test is **frozen**: the implementer changes
-code until it passes; a test that genuinely must change comes back to you with the reason, and you
-re-certify.
+user only about an assert that looks off. This test is the first row of step 4's branch table; the
+suite freezes there, once every branch has its row.
 
 ## 2. Root
 
@@ -54,7 +53,8 @@ that pay for themselves:
   sibling already solved the same problem before concluding a fix needs a schema change or new
   plumbing, and reuse its approach.
 - **Live check** — an assumption about "how the data always looks" is a guess until a live query
-  confirms it across more than one row.
+  confirms it across more than one row. Keep the edge values it turns up (nulls, legacy formats,
+  codes nothing resolves) — they become rows in step 4.
 
 Root is done when you can point to the exact mechanism producing the failure, with evidence, not
 inference. Genuinely unclear after a real look → `diagnosing-bugs` is the deeper loop for that;
@@ -66,18 +66,36 @@ Invoke `grilling`, scoped to the decisions this fix actually needs: which approa
 reuse vs. rewrite, and — if a second, unrelated bug turned up in Root — whether it bundles into
 this fix or splits into its own ticket (splits into `handoff` to write up).
 
-## 4. Delegate
+## 4. Branches — every rule red before the fix
 
-A root cause + a plan is a fully-defined ticket — hand it to the specialist agent for that layer
-(`backend-dev`, `frontend-dev`, ...), the workspace's default for any fully-defined ticket. The
-brief names the frozen test file.
+The decisions from steps 0 and 3 are rules, and each rule splits into **branches**: the case it
+holds and the case it lets through. Root's live check adds the edge values real data carries. Lay
+them out as one table — branch · input · expected · test case · fixture — with step 1's repro as
+the first row.
+
+Done when every row either names a test case that went **red** on the unfixed code for that row's
+reason, or reads `uncovered: <why> → proven by <what>` (a unit test, code review). A fixture enters
+the table only after it has been used once for real (logged in, read back), so a bad fixture
+surfaces here rather than mid-review; one that needs a write to shared data is a yes from the user,
+asked here.
+
+Certify each case the way step 1 certifies the repro, against its row's expected — an assert that
+accepts any value where the row names one lets a wrong fix go green. The certified suite is
+**frozen**: the implementer changes code until it passes; a test that genuinely must change comes
+back to you with the reason, and you re-certify.
+
+## 5. Delegate
+
+A root cause + a plan + a branch table is a fully-defined ticket — hand it to the specialist agent
+for that layer (`backend-dev`, `frontend-dev`, ...), the workspace's default for any fully-defined
+ticket. The brief carries the branch table and names the frozen test files.
 
 Implement it yourself when the fix is small enough to finish in a handful of tool calls (≈5) —
 writing the fix and its test costs less than briefing an agent. Delegate everything past that size.
 
-## 5. Review loop
+## 6. Review loop
 
-Run `/code-review`. Send findings back to whoever implemented the fix; they fix, then rerun the
+Run `/code-review`, handing its Spec axis the branch table to check the code against. Send findings back to whoever implemented the fix; they fix, then rerun the
 repro test and the wider suite. Repeat until the review is clean and every test is green — done is
 "review ran clean," not "review ran."
 
@@ -85,12 +103,12 @@ No cap on rounds. Two rounds failing for the same cause means Root was wrong: go
 with that failure as evidence, rather than patching a third time.
 
 - **Flaky** — a test that passes and fails on the same code gets one rerun. Still unsure → name it
-  unstable and report `not proven` (step 6).
+  unstable and report `not proven` (step 7).
 - **Catch up** — once green, bring in the PR/MR's target branch and rerun. Not pushed yet → rebase
   onto it. Already pushed (a follow-up into an open PR/MR) → merge it in, keeping the pushed
   history intact. Red after → back into the loop.
 
-## 6. Close
+## 7. Close
 
 Report one status, plus one line on what actually ran: `passed` · `not proven` (a gate couldn't
 run — environment down, missing fixture) · `failed` · `no code change`.
