@@ -61,9 +61,19 @@ Claude Code skills ของฉัน เก็บรวมไว้ที่น
 [`agents/`](agents/) — subagent กลาง symlink ทั้งโฟลเดอร์ไปที่ `~/.claude/agents` · ส่วนเฉพาะโปรเจกต์ไม่อยู่ที่นี่ — agent อ่าน `.claude/agent-notes/<name>.md` ของโปรเจกต์เองถ้ามี
 โปรเจกต์ที่มี `.claude/agents/<name>.md` ชื่อเดียวกัน = ตัวในโปรเจกต์ชนะ ตัวกลางไม่ถูกเรียกเลย
 
-| agent | ทำอะไร |
-|---|---|
-| [`frontend-dev`](agents/frontend-dev.md) | ลงมือทำใบงาน frontend ที่นิยามครบแล้ว — ponytail + AGENTS.md, ตั้งชื่อ element ให้ e2e เรียกได้ |
+| agent | model · effort | ทำอะไร |
+|---|---|---|
+| [`ba`](agents/ba.md) | sonnet · xhigh | เขียน/ทบทวน BR ภาษาธุรกิจ ตัดสินเมื่อ requirement ขัดกัน |
+| [`sa`](agents/sa.md) | opus · xhigh | design spec — API contract, field → column mapping, database impact |
+| [`dba`](agents/dba.md) | sonnet · xhigh | ยืนยันคอลัมน์/sequence/ข้อมูลจริงกับ DB เอง อ่านอย่างเดียวโดยปริยาย |
+| [`tech-lead`](agents/tech-lead.md) | opus · xhigh | ตัดสินเรื่องย้อนยาก งานคร่อมทีม DB ที่ใช้ร่วมกับระบบอื่น — อ่านอย่างเดียว |
+| [`backend-dev`](agents/backend-dev.md) | sonnet · xhigh | ลงมือทำใบงาน backend ที่นิยามครบแล้ว — ponytail + AGENTS.md |
+| [`frontend-dev`](agents/frontend-dev.md) | sonnet · xhigh | ลงมือทำใบงาน frontend ที่นิยามครบแล้ว — ponytail + AGENTS.md, ตั้งชื่อ element ให้ e2e เรียกได้ |
+| [`qa`](agents/qa.md) | sonnet · xhigh | ออก test case หา defect ตอบ "พร้อมส่ง UAT ไหม" เป็นสามกอง |
+| [`dod`](agents/dod.md) | sonnet · xhigh | หลักฐานทดสอบผ่านหน้าจอจริง (เอกสาร + PDF + ภาพ) ก้อนสุดท้ายของฟีเจอร์ |
+| [`comment-trimmer`](agents/comment-trimmer.md) | sonnet · high | ล้าง comment ที่มีร่องรอย AI ก่อนส่งโค้ดให้ทีมที่ไม่ใช้ AI |
+
+effort ใน frontmatter มีผลกับ subagent ธรรมดาเท่านั้น — teammate ที่เปิดเป็น pane แยก (ทดสอบกับ `cmux claude-teams`) ไม่อ่านค่านี้ ใช้ effort ของ lead หรือ `modelSettings` ใน settings แทน
 
 ## sync เข้าเครื่องใหม่
 
