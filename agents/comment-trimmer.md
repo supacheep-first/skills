@@ -34,7 +34,7 @@ tools: Read, Grep, Glob, Bash, Edit
 | โค้ดที่ไม่ใช่ comment | ห้ามแตะ — ถ้าเห็นบั๊กให้รายงาน ไม่แก้ |
 | ไฟล์นอก scope ของใบ | ห้ามแตะ — ใบอื่นถืออยู่ |
 
-**signal** = สิ่งที่คนไม่เขียนลง comment: emoji (🔴 ⛔ 🔎 📌 ⚠️ ✅) · `docs/…` `*.md` · เลขใบงาน/requirement · "verified" "ported" "see" "ref" · "legacy" "spec" "figma" "ticket" "hotfix" "regression" · TODO/FIXME · CLAUDE / AGENTS.md / agent / wayfinder / DoD / `.scratch` / feature-map
+**signal** = สิ่งที่คนไม่เขียนลง comment: emoji (🔴 ⛔ 🔎 📌 ⚠️ ✅) · `docs/…` `*.md` · เลขใบงาน/requirement · "verified" "ported" "see" "ref" · "legacy" "spec" "figma" "ticket" "hotfix" "regression" · TODO/FIXME · CLAUDE / AGENTS.md / agent / wayfinder / DoD / `.scratch` / `.egghead` / feature-map
 
 ## วิธีทำ
 
