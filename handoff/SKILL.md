@@ -5,7 +5,7 @@ argument-hint: "What will the next session be used for?"
 disable-model-invocation: true
 ---
 
-Write a handoff document summarising the current conversation so a fresh agent can continue the work. Save to the `.egghead/.handoff/` directory.
+Write a handoff document summarising the current conversation so a fresh agent can continue the work. Save to the `.egghead/.handoff/` directory as `NNN-YYMMDD-slug.md`: `NNN` = the next 3-digit number after the highest existing prefix in that directory (`001` if none), `YYMMDD` = today from `date +%y%m%d`, `slug` = short kebab-case topic.
 
 Include a "suggested skills" section in the document, which suggests skills that the agent should invoke.
 
