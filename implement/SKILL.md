@@ -24,7 +24,7 @@ Everything below applies **inside this loop only**. It says nothing about how to
    Build it yourself only when the spec is still forming as you go; **if you choose that, write the reason into the ticket's `Rounds`** so the next session can see it was a decision, not a drift.
    **This step is worthless after the fact.** Read source first and delegation always *feels* uneconomical — the context is already in your head. That feeling is an artifact of the order you opened files in, not evidence about the work.
    You still own everything else: the three gates, the review, the feature map, closing the ticket, and shutting the agents down when it closes.
-3. **Claim it before any work**: write your name *and today's date* into **Assignee**. A claim dated before today is dead — take the ticket, don't wait for anyone to release it.
+3. **Claim it before any work**: write your name *and today's date* into **Assignee**. A claim dated before today is dead — take the ticket, don't wait for anyone to release it. Then name the session `<slug>-issue-<NN>` (see **Name the session**).
 4. Build the whole vertical slice: it has to be demoable on its own.
 5. **Pass all three gates, in order. A failed gate means staying on this ticket, never moving to the next one.**
    - **Gate 1** — this repo's runnable check is green.
@@ -35,6 +35,18 @@ Everything below applies **inside this loop only**. It says nothing about how to
 7. **One ticket per session.** Stop there and report; the next session takes the next frontier ticket. End the report with the command to start it, copied from `HOW-TO-WORK.md`, path relative to the workspace root (`/implement .egghead/…/HOW-TO-WORK.md`), never absolute.
 
 When the frontier is empty, don't take more work: write the **`## Build status`** section at the end of `HOW-TO-WORK.md` and stop.
+
+### Name the session
+
+The session that claims a ticket names itself `<slug>-issue-<NN>` (`<slug>` = the feature dir, `<NN>` = the ticket's number prefix), so parallel sessions can be told apart. Only the claiming session, never a subagent.
+
+1. Read the current name: `grep -h '"custom-title"' ~/.claude/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl 2>/dev/null | tail -1 | jq -r .customTitle`
+2. Empty → rename. Already the target → nothing to do. Any other name → **ask the user first**; never replace it on your own.
+3. A `/rename` typed mid-turn is not submitted, so queue it for the end of this turn:
+   ```sh
+   nohup sh -c 'cmux events --name agent.hook.Stop --no-ack | { grep -q -m1 "\"surface_id\":\"$CMUX_SURFACE_ID\"" && sleep 1 && cmux send "/rename <slug>-issue-<NN>\n"; }' >/dev/null 2>&1 &
+   ```
+   No `$CMUX_SURFACE_ID` (not in cmux) → end your report with `/rename <slug>-issue-<NN>` for the user to type.
 
 ### Bring the environment up yourself
 

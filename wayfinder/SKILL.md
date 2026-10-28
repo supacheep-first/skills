@@ -144,10 +144,22 @@ User invokes with a loose idea.
 User invokes with a map (URL or number). A ticket is **optional**: without one, you pick the next decision, not the user.
 
 1. Load the **map**: the low-res view, not every ticket body.
-2. Choose the ticket. If the user named one, use it. Otherwise take the first frontier ticket in order. **Claim it**: assign it to yourself before any work.
+2. Choose the ticket. If the user named one, use it. Otherwise take the first frontier ticket in order. **Claim it**: assign it to yourself before any work, then name the session `<slug>-ticket-<NN>` (see **Name the session**).
 3. Resolve it. **Zoom as needed**: fetch the full body of any related or closed ticket on demand; call the Skill tool for whichever skills the `## Notes` block names. If in doubt, call the Skill tool twice, for "grilling" and "domain-modeling".
 4. Record the resolution: post the answer as a **resolution comment**, **close** the issue, and **append a context pointer** to the map's Decisions-so-far.
 5. Add newly-surfaced tickets (create-then-wire); graduate any fog the answer has made specifiable, clearing each graduated patch from **Not yet specified** so it lives only as its new ticket. If the answer reveals that a ticket (this one or another) sits beyond the destination, **rule it out of scope** rather than resolving it on the route. If the decision invalidates other parts of the map, update or delete those tickets.
 6. **Check for arrival.** If the frontier is now empty, graduate what remains in **Not yet specified**; if nothing remains there either, you have arrived: write **Destination status** (see [Arrival](#arrival)) and stop.
 
 The user may run unblocked tickets in parallel, so expect other sessions to be editing the tracker concurrently.
+
+### Name the session
+
+The session that claims a ticket names itself `<slug>-ticket-<NN>` (`<slug>` = the map's dir, `<NN>` = the ticket's number prefix), so parallel sessions can be told apart. Only the claiming session, never a subagent.
+
+1. Read the current name: `grep -h '"custom-title"' ~/.claude/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl 2>/dev/null | tail -1 | jq -r .customTitle`
+2. Empty → rename. Already the target → nothing to do. Any other name → **ask the user first**; never replace it on your own.
+3. A `/rename` typed mid-turn is not submitted, so queue it for the end of this turn:
+   ```sh
+   nohup sh -c 'cmux events --name agent.hook.Stop --no-ack | { grep -q -m1 "\"surface_id\":\"$CMUX_SURFACE_ID\"" && sleep 1 && cmux send "/rename <slug>-ticket-<NN>\n"; }' >/dev/null 2>&1 &
+   ```
+   No `$CMUX_SURFACE_ID` (not in cmux) → end your report with `/rename <slug>-ticket-<NN>` for the user to type.
