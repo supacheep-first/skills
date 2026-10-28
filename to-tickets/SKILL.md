@@ -59,12 +59,12 @@ Iterate until the user approves the breakdown.
 
 Publish the approved tickets. **How** depends on the tracker `/setup-matt-pocock-skills` configured; the tickets are the same either way, only the shape of the blocking edges changes:
 
-- **Local files** → write one file per ticket under `.egghead/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01` in dependency order (blockers first). Each file's "Blocked by" lists the numbers/titles it depends on. Use the per-ticket file template below: one ticket per file, never a single combined file.
+- **Local files** → write one file per ticket under `.egghead/.wayfinder/<feature-slug>/issues/<NN>-<slug>.md`, inside the same feature dir as the wayfinder `map.md` and `tickets/` (same slug; create the dir if there is no map), numbered from `01` in dependency order (blockers first). Each file's "Blocked by" lists the numbers/titles it depends on. Use the per-ticket file template below: one ticket per file, never a single combined file.
 - **A real issue tracker (GitHub, Linear, …)** → publish one issue per ticket in dependency order (blockers first) so each ticket's blocking edges can reference real identifiers. Use the platform's native blocking / sub-issue relationship where it has one; otherwise set each ticket's "Blocked by" to the blocking issues. Apply the `ready-for-agent` triage label unless instructed otherwise; the tickets are agent-grabbable by construction.
 
 Work the **frontier**: any ticket whose blockers are all done, minus anything already claimed (see **Assignee**). For a purely linear chain that means top to bottom.
 
-**On the local-files tracker, also write `.egghead/<feature-slug>/issues/HOW-TO-WORK.md`** next to the tickets: how to enter the loop (the command to type), the frontier rule, the claim rule, the three gates, one ticket per session, and an ASCII board of the tickets with their blocking edges. It is the first file any session opens; the tickets are the detail behind it.
+**On the local-files tracker, also write `.egghead/.wayfinder/<feature-slug>/issues/HOW-TO-WORK.md`** next to the tickets: how to enter the loop (the command to type, path relative to the workspace root, never absolute: `/implement .egghead/.wayfinder/<feature-slug>/issues/HOW-TO-WORK.md`), the frontier rule, the claim rule, the three gates, one ticket per session, and an ASCII board of the tickets with their blocking edges. It is the first file any session opens; the tickets are the detail behind it.
 
 Give it a **`## Answers already given`** section, empty to start. Every answer the user hands a session mid-loop goes there — which environment to test against, whether an e2e spec may create real data, a direction already ruled out. A loop that asks the same question every ticket is no better than doing the work by hand, and no session can remember across the others.
 
