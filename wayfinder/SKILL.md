@@ -158,8 +158,9 @@ The session that claims a ticket names itself `<slug>-ticket-<NN>` (`<slug>` = t
 
 1. Read the current name: `grep -h '"custom-title"' ~/.claude/projects/*/"$CLAUDE_CODE_SESSION_ID".jsonl 2>/dev/null | tail -1 | jq -r .customTitle`
 2. Empty → rename. Already the target → nothing to do. Any other name → **ask the user first**; never replace it on your own.
-3. A `/rename` typed mid-turn is not submitted, so queue it for the end of this turn:
+3. Rename the cmux tab now, and queue `/rename` for the end of this turn: one typed mid-turn is not submitted, and the claiming turn often runs the whole ticket.
    ```sh
+   cmux rename-tab --surface "$CMUX_SURFACE_ID" <slug>-ticket-<NN>
    nohup sh -c 'cmux events --name agent.hook.Stop --no-ack | { grep -q -m1 "\"surface_id\":\"$CMUX_SURFACE_ID\"" && sleep 1 && cmux send "/rename <slug>-ticket-<NN>\n"; }' >/dev/null 2>&1 &
    ```
    No `$CMUX_SURFACE_ID` (not in cmux) → end your report with `/rename <slug>-ticket-<NN>` for the user to type.
